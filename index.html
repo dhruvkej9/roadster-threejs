@@ -30,12 +30,16 @@
   #hint{position:fixed;bottom:6px;left:10px;color:#8b98a8;font-size:10px;line-height:1.5;pointer-events:none;z-index:5}
   #boots{position:fixed;inset:0;display:grid;place-items:center;background:#0f0f10;color:#67e8f9;
          font-size:13px;letter-spacing:.16em;z-index:9}
+  /* collision needs feedback: without a flash the speed drop just reads as a bug */
+  #crash{position:fixed;inset:0;pointer-events:none;opacity:0;z-index:4;
+         box-shadow:inset 0 0 120px 24px rgba(248,113,113,.85)}
   body:not(.touch) #pad,body:not(.touch) .btn{display:none}
   body.touch #hint{display:none}
 </style>
 </head>
 <body>
 <div id="boots">LOADING CITY…</div>
+<div id="crash"></div>
 <div id="hud">
   <div>SPD <b id="spd">0</b> &nbsp; ALT <b id="alt">0</b> &nbsp; <b id="mode">GROUND</b></div>
   <div>NITROGEN</div>
@@ -56,7 +60,7 @@
 import * as THREE from 'three';
 
 const el = id => document.getElementById(id);
-const hud = { spd:el('spd'), alt:el('alt'), mode:el('mode'), gas:el('gasfill'), boots:el('boots') };
+const hud = { spd:el('spd'), alt:el('alt'), mode:el('mode'), gas:el('gasfill'), boots:el('boots'), crash:el('crash') };
 
 // ponytail: coarse pointer == phone/tablet. 1388 separate meshes + a 2048 shadow map
 // is exactly what melts a mid-range phone, so drop both instead of micro-optimising.
@@ -97,6 +101,8 @@ const bMat   = new THREE.MeshStandardMaterial({ color:0x2a3038, roughness:.85, m
 const bMat2  = new THREE.MeshStandardMaterial({ color:0x353c46, roughness:.8,  metalness:.1 });
 const winMat = new THREE.MeshBasicMaterial({ color:0x8fd0ff });
 
+// collision volumes, bucketed per grid block so a frame only ever tests 3x3 blocks
+const blocks = new Map();
 let buildingCount = 0;
 for (let gx = -N; gx <= N; gx++) for (let gz = -N; gz <= N; gz++) {
   if (gx === 0 && gz === 0) continue;
@@ -111,6 +117,9 @@ for (let gx = -N; gx <= N; gx++) for (let gz = -N; gz <= N; gz++) {
     m.position.set(cx + ox, h/2, cz + oz);
     m.castShadow = !TOUCH; m.receiveShadow = !TOUCH;
     scene.add(m); buildingCount++;
+    const key = gx + ',' + gz;
+    if (!blocks.has(key)) blocks.set(key, []);
+    blocks.get(key).push({ x: cx + ox, z: cz + oz, hw: w/2, hd: d/2, h });
     if (!TOUCH) {                      // window strips are decoration only; skip on phone
       const strip = new THREE.Mesh(new THREE.BoxGeometry(w*1.005, 1.2, d*1.005), winMat);
       strip.position.set(cx + ox, h*(0.35 + (i%3)*0.22), cz + oz);
@@ -219,7 +228,48 @@ function readInput(){
   };
 }
 
-// ponytail: no building collision — free-roam sandbox. Add AABB sweep when it matters.
+// Circle-vs-AABB resolve against the 3x3 neighbouring blocks only. Without this the car
+// drives straight through towers — the whole city is only ever tested when it is nearby.
+const CAR_R = 1.7;
+let crashFlash = 0;
+function collide(){
+  const gx = Math.round(s.pos.x / BLOCK), gz = Math.round(s.pos.z / BLOCK);
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+    const arr = blocks.get((gx+i) + ',' + (gz+j));
+    if (!arr) continue;
+    for (const b of arr) {
+      if (s.pos.y > b.h) continue;                    // flying over the top: no hit
+      const nx0 = Math.max(b.x - b.hw, Math.min(s.pos.x, b.x + b.hw));
+      const nz0 = Math.max(b.z - b.hd, Math.min(s.pos.z, b.z + b.hd));
+      let dx = s.pos.x - nx0, dz = s.pos.z - nz0;
+      let d = Math.hypot(dx, dz);
+      if (d >= CAR_R) continue;
+      if (d < 1e-6) {
+        // Dead centre on the AABB: there is no normal to push along. Eject past the
+        // nearest FACE by CAR_R. (Dividing by a fake d=1e-4 instead threw the car
+        // ~17km — found by the teleport-into-building check.)
+        const exits = [
+          [Math.abs((b.x - b.hw) - s.pos.x), 'x', (b.x - b.hw) - CAR_R],
+          [Math.abs(s.pos.x - (b.x + b.hw)), 'x', (b.x + b.hw) + CAR_R],
+          [Math.abs((b.z - b.hd) - s.pos.z), 'z', (b.z - b.hd) - CAR_R],
+          [Math.abs(s.pos.z - (b.z + b.hd)), 'z', (b.z + b.hd) + CAR_R],
+        ];
+        exits.sort((a, c) => a[0] - c[0]);
+        if (exits[0][1] === 'x') s.pos.x = exits[0][2]; else s.pos.z = exits[0][2];
+        s.vel *= 0.25; crashFlash = 1;
+        continue;
+      }
+      const push = CAR_R - d;                       // bounded: never more than CAR_R
+      s.pos.x += (dx/d) * push; s.pos.z += (dz/d) * push;
+      const ux = dx/d, uz = dz/d;
+      const into = s.vel * (Math.sin(s.yaw) * ux + Math.cos(s.yaw) * uz);
+      if (into > 0) { s.vel *= 0.25; crashFlash = 1; }   // scrub speed, flash
+    }
+  }
+}
+
+// ponytail: no roof landings — you bounce off the wall, you do not perch on it.
+// Add vertical AABB tops if roof parking ever matters.
 function update(dt){
   const { thr, turn, up, down } = readInput();
 
@@ -242,6 +292,7 @@ function update(dt){
   s.flying = !grounded;
   s.pos.x += Math.sin(s.yaw) * s.vel * dt;
   s.pos.z += Math.cos(s.yaw) * s.vel * dt;
+  collide();
 
   car.position.copy(s.pos);
   car.rotation.y = s.yaw;
@@ -262,6 +313,8 @@ function update(dt){
   hud.alt.textContent  = s.pos.y.toFixed(0);
   hud.mode.textContent = grounded ? 'GROUND' : (s.gas<=0 ? 'DRY' : 'FLIGHT');
   hud.gas.style.width  = s.gas + '%';
+  crashFlash = Math.max(0, crashFlash - 3.2*dt);
+  hud.crash.style.opacity = crashFlash.toFixed(3);
 }
 
 const clock = new THREE.Clock();
@@ -282,6 +335,9 @@ console.assert(THRUSTERS.length === 10, 'thruster count changed');
 console.assert(buildingCount > 100, `city too small: ${buildingCount}`);
 console.assert(s.gas === 100 && s.pos.y === HOME.y, 'must boot landed with full tank');
 console.assert(tc.steer === 0 && tc.throttle === 0 && !tc.up && !tc.down, 'touch state must start neutral');
+console.assert(blocks.size > 0, 'collision volumes must be registered');
+// test hook: lets the collision check assert "car never inside a building", not eyeball it
+window.__dbg = { s, blocks, CAR_R };
 window.__ready = true; window.__buildings = buildingCount; window.__touch = TOUCH;
 </script>
 </body>
