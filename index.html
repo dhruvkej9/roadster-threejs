@@ -170,7 +170,7 @@ for (const [x,y,z] of THRUSTERS) {
 const kb = new Set();
 const tc = { steer:0, throttle:0, up:false, down:false };
 const HOME = new THREE.Vector3(0, 0.02, 0);
-const s = { pos:HOME.clone(), yaw:0, vel:0, vy:0, gas:100, flying:false };
+const s = { pos:HOME.clone(), yaw:0, vel:0, vy:0, gas:100, flying:false, prevY:HOME.y };
 
 addEventListener('keydown', e => {
   kb.add(e.code);
@@ -232,13 +232,36 @@ function readInput(){
 // drives straight through towers — the whole city is only ever tested when it is nearby.
 const CAR_R = 1.7;
 let crashFlash = 0;
+let groundY = HOME.y;                 // street OR roof we are standing on; refreshed by collide()
+
 function collide(){
   const gx = Math.round(s.pos.x / BLOCK), gz = Math.round(s.pos.z / BLOCK);
+  const near = [];
   for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
     const arr = blocks.get((gx+i) + ',' + (gz+j));
-    if (!arr) continue;
-    for (const b of arr) {
-      if (s.pos.y > b.h) continue;                    // flying over the top: no hit
+    if (arr) near.push(...arr);
+  }
+  // pass 1 — what surface is under us? Two ways a roof counts:
+  //   (a) we are resting on it (b.h at or just below our wheels), or
+  //   (b) we CROSSED DOWN through it this frame.
+  // (b) matters because at 60fps a fast fall moves ~0.6m per frame, so a plain
+  // "b.h <= pos.y + small" test misses the roof entirely and we fall straight past it.
+  let sup = 0, supB = null;
+  for (const b of near) {
+    if (s.pos.x <= b.x-b.hw || s.pos.x >= b.x+b.hw) continue;
+    if (s.pos.z <= b.z-b.hd || s.pos.z >= b.z+b.hd) continue;
+    const resting = b.h <= s.pos.y + 0.4;              // sitting on it
+    const crossed = s.prevY >= b.h && s.vy <= 0;        // fell through it this frame
+    if (!resting && !crossed) continue;
+    if (b.h > sup) { sup = b.h; supB = b; }
+  }
+  groundY = sup + 0.02;
+
+  // pass 2 — walls. Skip a building we are standing on top of, else parking on a roof
+  // would eject the car sideways the moment it touched down.
+  for (const b of near) {
+      if (b === supB) continue;                        // the roof we are resting on never pushes us
+      if (s.pos.y > b.h - 0.05) continue;              // at/above roof: no wall push
       const nx0 = Math.max(b.x - b.hw, Math.min(s.pos.x, b.x + b.hw));
       const nz0 = Math.max(b.z - b.hd, Math.min(s.pos.z, b.z + b.hd));
       let dx = s.pos.x - nx0, dz = s.pos.z - nz0;
@@ -264,12 +287,15 @@ function collide(){
       const ux = dx/d, uz = dz/d;
       const into = s.vel * (Math.sin(s.yaw) * ux + Math.cos(s.yaw) * uz);
       if (into > 0) { s.vel *= 0.25; crashFlash = 1; }   // scrub speed, flash
-    }
   }
+
+  // land on it — only while falling, so thrust still lifts off from a roof
+  if (s.vy <= 0 && s.pos.y < groundY) { s.pos.y = groundY; s.vy = 0; }
 }
 
-// ponytail: no roof landings — you bounce off the wall, you do not perch on it.
-// Add vertical AABB tops if roof parking ever matters.
+// Roofs are landable: collide() pass 1 finds the highest roof under the wheels and
+// pass 2 skips its walls, so the car can sit and drive on top. No ceilings/ramps —
+// if you want to fly into a rooftop from below you still bonk the facade.
 function update(dt){
   const { thr, turn, up, down } = readInput();
 
@@ -278,21 +304,22 @@ function update(dt){
   s.vel *= (1 - 1.5*dt);
   s.vel = THREE.MathUtils.clamp(s.vel, -16, 68);
 
-  const grounded = s.pos.y <= HOME.y + 0.001 && s.vy <= 0;
   let burn = 0;
-  if (up && s.gas > 0)       { s.vy += 27*dt; s.gas -= 15*dt; burn = 1; }
-  if (down && s.pos.y > 0.1) { s.vy -= 23*dt; burn = Math.max(burn,.45); }
-  // ponytail: refuel + ground-clamp must NOT run while ascending, or SPACE kills the
-  // lift it just added and the car can never take off from a standstill.
-  if (grounded && !up) { s.gas = Math.min(100, s.gas + 20*dt); s.vy = 0; }
+  if (up && s.gas > 0)                  { s.vy += 27*dt; s.gas -= 15*dt; burn = 1; }
+  if (down && s.pos.y > groundY + 0.1)  { s.vy -= 23*dt; burn = Math.max(burn,.45); }
   s.gas = THREE.MathUtils.clamp(s.gas, 0, 100);
+  s.prevY = s.pos.y;                  // so collide() can tell "crossed down through a roof"
   s.vy -= 15*dt; s.pos.y += s.vy*dt;
-  if (s.pos.y < HOME.y) { s.pos.y = HOME.y; s.vy = 0; }
 
-  s.flying = !grounded;
   s.pos.x += Math.sin(s.yaw) * s.vel * dt;
   s.pos.z += Math.cos(s.yaw) * s.vel * dt;
-  collide();
+  collide();                       // refreshes groundY (street or roof), pushes walls, lands
+
+  // ponytail: refuel + clamp must NOT run while ascending, or SPACE kills the lift it
+  // just added and the car can never take off — from the street or from a roof.
+  const grounded = s.pos.y <= groundY + 0.001 && s.vy <= 0;
+  if (grounded && !up) { s.gas = Math.min(100, s.gas + 20*dt); s.vy = 0; }
+  s.flying = !grounded;
 
   car.position.copy(s.pos);
   car.rotation.y = s.yaw;
@@ -337,7 +364,7 @@ console.assert(s.gas === 100 && s.pos.y === HOME.y, 'must boot landed with full 
 console.assert(tc.steer === 0 && tc.throttle === 0 && !tc.up && !tc.down, 'touch state must start neutral');
 console.assert(blocks.size > 0, 'collision volumes must be registered');
 // test hook: lets the collision check assert "car never inside a building", not eyeball it
-window.__dbg = { s, blocks, CAR_R };
+window.__dbg = { s, blocks, CAR_R, get groundY(){ return groundY; } };
 window.__ready = true; window.__buildings = buildingCount; window.__touch = TOUCH;
 </script>
 </body>
